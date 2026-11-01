@@ -1,0 +1,40 @@
+
+from flask import Flask
+
+from app.api.video import video_bp
+from app.services.case_store import CaseStore
+from app.api.cases import cases_bp
+from app.api.evidence import evidence_bp
+
+def create_app(test_config=None):
+    app = Flask(__name__)
+
+    app.config.update(
+        MAX_CONTENT_LENGTH=250 * 1024 * 1024,
+        DATABASE_PATH="data/crimevision.db",
+    )
+
+    if test_config:
+        app.config.update(test_config)
+
+    # One persistent store shared by all API endpoints.
+    app.extensions["crimevision_case_store"] = CaseStore(
+        app.config["DATABASE_PATH"]
+    )
+
+    from app.api.detection import detection_bp
+    from app.api.audio import audio_bp
+
+    app.register_blueprint(evidence_bp, url_prefix="/api")
+    app.register_blueprint(detection_bp, url_prefix="/api")
+    app.register_blueprint(audio_bp, url_prefix="/api")
+    app.register_blueprint(video_bp, url_prefix="/api")
+    app.register_blueprint(cases_bp, url_prefix="/api")
+    @app.get("/health")
+    def health():
+        return {
+            "status": "ok",
+            "service": "CrimeVision",
+        }, 200
+
+    return app

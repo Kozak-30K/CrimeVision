@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Frontend dependencies and builds
+frontend/node_modules/
+frontend/dist/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Evidence and generated output
+evidence/
+outputs/
+runs/
+
+# Local databases
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Downloaded packages and editor settings
+*.whl
+.vscode/

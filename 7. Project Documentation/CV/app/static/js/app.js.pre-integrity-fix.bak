@@ -1,0 +1,893 @@
+"use strict";
+
+const $ = (selector) => document.querySelector(selector);
+
+const state = {
+    cases: [],
+    selectedCaseId: null,
+    evidence: [],
+    analyses: [],
+    busy: false,
+    noticeTimer: null
+};
+
+const modalityIcons = {
+    image: "▧",
+    audio: "♫",
+    video: "▷"
+};
+
+function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+    })[character]);
+}
+
+function formatDate(value) {
+    if (!value) return "Not available";
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+
+    return date.toLocaleString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+    });
+}
+
+function formatBytes(value) {
+    const bytes = Number(value);
+
+    if (!Number.isFinite(bytes) || bytes < 0) return "Size unavailable";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) {
+        return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+async function apiRequest(url, options = {}) {
+    let response;
+
+    try {
+        response = await fetch(url, options);
+    } catch {
+        throw new Error(
+            "Cannot reach the CrimeVision backend. Check that the Flask server is running."
+        );
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    let payload;
+
+    if (contentType.includes("application/json")) {
+        payload = await response.json();
+    } else {
+        payload = await response.text();
+    }
+
+    if (!response.ok) {
+        let message = `Request failed (${response.status})`;
+
+        if (payload && typeof payload === "object") {
+            message = payload.error || payload.message || message;
+        } else if (typeof payload === "string" && payload.trim()) {
+            message = payload.slice(0, 300);
+        }
+
+        throw new Error(message);
+    }
+
+    return payload;
+}
+
+function showNotice(message, type = "success") {
+    const notice = $("#notice");
+
+    notice.textContent = message;
+    notice.classList.remove("hidden", "error");
+
+    if (type === "error") notice.classList.add("error");
+
+    if (state.noticeTimer) clearTimeout(state.noticeTimer);
+
+    state.noticeTimer = setTimeout(() => {
+        notice.classList.add("hidden");
+    }, 6500);
+}
+
+function setBusy(button, busy, busyText = "Working…") {
+    if (!button) return;
+
+    if (busy) {
+        button.dataset.originalText = button.textContent;
+        button.textContent = busyText;
+        button.disabled = true;
+    } else {
+        button.textContent = button.dataset.originalText || button.textContent;
+        delete button.dataset.originalText;
+        button.disabled = false;
+    }
+}
+
+function setConnection(online, message) {
+    $("#engine-status").textContent = message;
+    $("#footer-connection").textContent = online
+        ? "Backend reachable"
+        : "Backend unavailable";
+
+    const dot = document.querySelector(".system-status .status-dot");
+    dot.classList.toggle("online", online);
+    dot.classList.toggle("offline", !online);
+}
+
+function updateStats() {
+    const openCases = state.cases.filter(
+        (item) => String(item.status || "").toLowerCase() === "open"
+    ).length;
+
+    $("#stat-total").textContent = state.cases.length;
+    $("#stat-open").textContent = openCases;
+
+    // Counts are based on the evidence and analysis loaded from the API.
+    $("#stat-evidence").textContent = "—";
+    $("#stat-analyses").textContent = "—";
+
+    $("#case-count-label").textContent =
+        `${state.cases.length} investigation${state.cases.length === 1 ? "" : "s"}`;
+}
+
+function renderCases() {
+    const container = $("#case-list");
+
+    if (!state.cases.length) {
+        container.innerHTML = `
+            <div class="list-empty">
+                <div>No investigations yet.</div>
+                <p>Create a case to begin organizing evidence.</p>
+                <button class="secondary-button" id="list-create-case">＋ Create case</button>
+            </div>
+        `;
+
+        $("#list-create-case")?.addEventListener("click", openCaseModal);
+        updateStats();
+        return;
+    }
+
+    container.innerHTML = state.cases.map((item) => {
+        const id = item.case_id;
+        const title = item.title || "Untitled investigation";
+        const description = item.description || "No description provided";
+        const status = String(item.status || "open").toLowerCase();
+        const selected = String(id) === String(state.selectedCaseId);
+
+        return `
+            <button class="case-row ${selected ? "selected" : ""}"
+                    data-case-id="${escapeHtml(id)}"
+                    type="button">
+                <div class="case-row-top">
+                    <span class="case-row-title">${escapeHtml(title)}</span>
+                    <span class="case-status ${status === "closed" ? "closed" : ""}">
+                        ${escapeHtml(status.toUpperCase())}
+                    </span>
+                </div>
+                <span class="case-row-description">${escapeHtml(description)}</span>
+                <span class="case-row-meta">
+                    <span>${escapeHtml(String(id))}</span>
+                    <span>${escapeHtml(formatDate(item.created_at_utc || item.created_at))}</span>
+                </span>
+            </button>
+        `;
+    }).join("");
+
+    container.querySelectorAll("[data-case-id]").forEach((button) => {
+        button.addEventListener("click", () => {
+            selectCase(button.dataset.caseId);
+        });
+    });
+
+    updateStats();
+}
+
+function renderSelectedCase() {
+    const selected = state.cases.find(
+        (item) => String(item.case_id) === String(state.selectedCaseId)
+    );
+
+    if (!selected) {
+        $("#empty-case").classList.remove("hidden");
+        $("#case-workspace").classList.add("hidden");
+        $("#selected-case-title").textContent = "Select an investigation";
+        $("#selected-case-status").textContent = "NO CASE";
+        $("#selected-case-status").className = "case-status no-case";
+        $("#breadcrumb-current").textContent = "Overview";
+        renderCases();
+        return;
+    }
+
+    $("#empty-case").classList.add("hidden");
+    $("#case-workspace").classList.remove("hidden");
+
+    $("#selected-case-title").textContent =
+        selected.title || "Untitled investigation";
+    $("#selected-case-description").textContent =
+        selected.description || "No description provided.";
+    $("#selected-case-id").textContent = String(selected.case_id);
+    $("#selected-case-created").textContent = formatDate(
+        selected.created_at_utc || selected.created_at
+    );
+    $("#selected-case-status").textContent =
+        String(selected.status || "open").toUpperCase();
+    $("#selected-case-status").className =
+        `case-status ${String(selected.status).toLowerCase() === "closed" ? "closed" : ""}`;
+    $("#breadcrumb-current").textContent = selected.title || "Investigation";
+
+    const isOpen = String(selected.status || "open").toLowerCase() === "open";
+    $("#upload-evidence").disabled = !isOpen || state.busy;
+    $("#analyze-case").disabled = state.busy;
+
+    if (!isOpen) {
+        $("#upload-zone").classList.add("closed-case");
+    } else {
+        $("#upload-zone").classList.remove("closed-case");
+    }
+
+    renderCases();
+}
+
+function renderEvidence() {
+    const container = $("#evidence-list");
+
+    $("#evidence-count").textContent =
+        `${state.evidence.length} ITEM${state.evidence.length === 1 ? "" : "S"}`;
+
+    if (!state.evidence.length) {
+        container.innerHTML = `
+            <div class="list-empty">No evidence has been registered for this case.</div>
+        `;
+    } else {
+        container.innerHTML = state.evidence.map((item) => {
+            const modality = String(item.modality || "file").toLowerCase();
+            const icon = modalityIcons[modality] || "▤";
+            const filename = item.filename || item.original_filename || "Evidence item";
+            const hash = item.sha256 || "";
+            const verified = item.integrity_verified === true;
+
+            return `
+                <article class="evidence-item">
+                    <div class="evidence-type-icon">${icon}</div>
+                    <div class="evidence-info">
+                        <div class="evidence-name">${escapeHtml(filename)}</div>
+                        <div class="evidence-meta">
+                            ${escapeHtml(modality.toUpperCase())}
+                            · ${escapeHtml(formatBytes(item.size_bytes))}
+                            · ${escapeHtml(formatDate(item.registered_at_utc))}
+                            ${hash ? `<br>SHA-256: ${escapeHtml(hash)}` : ""}
+                        </div>
+                    </div>
+                    <span class="integrity-tag ${verified ? "" : "unverified"}">
+                        ${verified ? "VERIFIED" : "RECORDED"}
+                    </span>
+                </article>
+            `;
+        }).join("");
+    }
+
+    // Evidence totals are summed from all cases currently loaded.
+    const selected = state.cases.find(
+        (item) => String(item.case_id) === String(state.selectedCaseId)
+    );
+
+    $("#stat-evidence").textContent = selected
+        ? state.evidence.length
+        : "—";
+}
+
+function printableResult(value) {
+    if (value === null || value === undefined) return "No result data.";
+    if (typeof value === "string") return value;
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch {
+        return String(value);
+    }
+}
+
+function renderAnalyses() {
+    const container = $("#analysis-results");
+
+    $("#analysis-count").textContent =
+        `${state.analyses.length} RECORD${state.analyses.length === 1 ? "" : "S"}`;
+
+    $("#stat-analyses").textContent = state.analyses.length;
+
+    if (!state.analyses.length) {
+        container.innerHTML = `
+            <div class="results-empty">
+                <span class="results-empty-icon">⌁</span>
+                <div>
+                    <h3>No saved analyses</h3>
+                    <p>Register evidence, then run the case analysis pipeline.</p>
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    const esc = (value) => escapeHtml(
+        value === null || value === undefined || value === "" ? "Not available" : String(value)
+    );
+
+    const pretty = (value) => String(value ?? "Unknown")
+        .replace(/[_-]+/g, " ")
+        .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+    const number = (value, digits = 1) => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed.toFixed(digits) : "N/A";
+    };
+
+    const confidence = (value) => {
+        const parsed = Number(value);
+        if (value === null || value === undefined || value === "" || !Number.isFinite(parsed)) {
+            return "Not provided";
+        }
+        return `${number(parsed * (parsed <= 1 ? 100 : 1), 1)}%`;
+    };
+
+    container.innerHTML = state.analyses.map((item, index) => {
+        const type = item.analysis_type || item.type || "Analysis result";
+        let result = item.result_json ?? item.result ?? item.output ?? item;
+
+        if (typeof result === "string") {
+            try {
+                result = JSON.parse(result);
+            } catch {
+                // Plain-text output remains visible in the raw result section.
+            }
+        }
+
+        const timestamp = item.created_at_utc || item.created_at;
+        const isObject = result && typeof result === "object" && !Array.isArray(result);
+        const observations = isObject && Array.isArray(result.observations)
+            ? result.observations : [];
+        const detections = observations.filter((observation) =>
+            observation && (observation.label || observation.class_name || observation.object)
+        );
+        const captions = observations.filter((observation) =>
+            observation && (observation.caption || observation.description || observation.text)
+        );
+        const anchors = isObject && Array.isArray(result.anchor_event_candidates)
+            ? result.anchor_event_candidates : [];
+        const timeline = isObject && result.timeline && typeof result.timeline === "object"
+            ? result.timeline : {};
+        const integrityResults = isObject && Array.isArray(result.evidence_results)
+            ? result.evidence_results : [];
+        const failedCount = Number(result?.failed_evidence_count ?? 0);
+        const reviewRequired = result?.requires_human_review === true;
+        const isReport = type === "case_forensic_report" || Boolean(
+            isObject && (
+                result.anchor_event_candidates ||
+                result.evidence_results ||
+                result.timeline ||
+                result.completed_evidence_count !== undefined
+            )
+        );
+
+        const observationCards = observations.map((observation) => {
+            const label = observation.label || observation.class_name ||
+                observation.object || observation.caption ||
+                observation.description || observation.text || observation.type ||
+                "Observation";
+            const score = observation.confidence;
+            const model = observation.model || observation.model_name;
+            return `
+                <div class="analysis-finding">
+                    <div class="analysis-finding-main">
+                        <strong>${esc(pretty(label))}</strong>
+                        <span>${esc(pretty(observation.observation_type || observation.kind || "Observation"))}</span>
+                    </div>
+                    <div class="analysis-finding-meta">
+                        <span>Confidence: ${esc(confidence(score))}</span>
+                        ${model ? `<span>Model: ${esc(model)}</span>` : ""}
+                        ${observation.timestamp ? `<span>Time: ${esc(observation.timestamp)}</span>` : ""}
+                    </div>
+                </div>
+            `;
+        }).join("");
+
+        const anchorCards = anchors.map((anchor) => `
+            <div class="analysis-finding">
+                <div class="analysis-finding-main">
+                    <strong>${esc(pretty(anchor.label || anchor.event || anchor.object || "Candidate event"))}</strong>
+                    <span>${esc(pretty(anchor.priority || anchor.review_priority || anchor.level || "Priority not specified"))} priority</span>
+                </div>
+                <div class="analysis-finding-meta">
+                    <span>Review score: ${esc(anchor.score ?? anchor.review_priority_score ?? "Not provided")}</span>
+                    <span>Confidence: ${esc(confidence(anchor.confidence))}</span>
+                </div>
+            </div>
+        `).join("");
+
+        const integrityCards = integrityResults.map((entry) => {
+            const checks = entry.checks && typeof entry.checks === "object"
+                ? Object.entries(entry.checks)
+                : [];
+            return `
+                <div class="analysis-finding">
+                    <div class="analysis-finding-main">
+                        <strong>${esc(entry.filename || entry.evidence_id || "Evidence item")}</strong>
+                        <span>${esc(pretty(entry.integrity_status || entry.status || "Status unavailable"))}</span>
+                    </div>
+                    ${checks.length ? `
+                        <div class="analysis-finding-meta">
+                            ${checks.map(([name, value]) =>
+                                `<span>${esc(pretty(name))}: ${value === true ? "Pass" : value === false ? "Fail" : esc(value)}</span>`
+                            ).join("")}
+                        </div>
+                    ` : ""}
+                </div>
+            `;
+        }).join("");
+
+        const captionText = captions
+            .map((observation) => observation.caption || observation.description || observation.text)
+            .filter(Boolean);
+
+        const raw = printableResult(result);
+        const summary = isReport ? `
+            <div class="analysis-summary-grid">
+                <div class="analysis-metric">
+                    <span>Evidence processed</span>
+                    <strong>${esc(result.completed_evidence_count ?? result.evidence_count ?? "N/A")}</strong>
+                </div>
+                <div class="analysis-metric">
+                    <span>Observations</span>
+                    <strong>${esc(result.observation_count ?? observations.length)}</strong>
+                </div>
+                <div class="analysis-metric">
+                    <span>Event candidates</span>
+                    <strong>${esc(anchors.length)}</strong>
+                </div>
+                <div class="analysis-metric">
+                    <span>Failed evidence</span>
+                    <strong>${esc(failedCount)}</strong>
+                </div>
+            </div>
+
+            ${reviewRequired ? `
+                <div class="analysis-notice">
+                    <strong>Human review required</strong>
+                    <p>These are preliminary AI observations, not verified conclusions. A qualified reviewer must assess the evidence.</p>
+                </div>
+            ` : ""}
+
+            ${captionText.length ? `
+                <section class="analysis-section">
+                    <h4>Scene description</h4>
+                    <div class="analysis-scene-narrative">
+                        <p class="analysis-description">${esc(captionText.join(" ").trim())}</p>
+                        <p class="analysis-scene-context">
+                            This description was generated automatically from visual content.
+                            Refer to the object detections below for individual model observations.
+                            The caption is preliminary and should be verified by a human reviewer.
+                        </p>
+                    </div>
+                </section>
+            ` : ""}
+
+            <section class="analysis-section">
+                <h4>Detected objects and observations (${observations.length})</h4>
+                ${observationCards || '<p class="analysis-muted">No observations were returned.</p>'}
+            </section>
+
+            ${anchors.length ? `
+                <section class="analysis-section">
+                    <h4>Review-priority candidates (${anchors.length})</h4>
+                    <p class="analysis-muted">Priority scores help organize review; they are not probabilities, proof, or guilt determinations.</p>
+                    ${anchorCards}
+                </section>
+            ` : ""}
+
+            <section class="analysis-section">
+                <h4>Timeline and cross-modal alignment</h4>
+                <div class="analysis-summary-grid">
+                    <div class="analysis-metric">
+                        <span>Aligned observations</span>
+                        <strong>${esc(timeline.aligned_count ?? result.cross_modal_analysis?.aligned_count ?? 0)}</strong>
+                    </div>
+                    <div class="analysis-metric">
+                        <span>Unsynchronized</span>
+                        <strong>${esc(timeline.unsynchronized_count ?? observations.filter((observation) => !observation.timestamp).length)}</strong>
+                    </div>
+                    <div class="analysis-metric">
+                        <span>Shared time origin</span>
+                        <strong>${timeline.shared_time_origin === true ? "Yes" : "No"}</strong>
+                    </div>
+                </div>
+                <p class="analysis-muted">Missing timestamps or alignment mean observations should not be assumed to describe the same event or moment.</p>
+            </section>
+
+            ${integrityResults.length ? `
+                <section class="analysis-section">
+                    <h4>Evidence integrity checks</h4>
+                    ${integrityCards}
+                    <p class="analysis-muted">A matching hash supports file consistency with its registered digest. It does not independently prove original authenticity or complete chain of custody.</p>
+                </section>
+            ` : ""}
+        ` : `
+            <section class="analysis-section">
+                <h4>Analysis output</h4>
+                ${observations.length ? observationCards : `<p class="analysis-description">${esc(typeof result === "string" ? result : "Structured output is available in Raw JSON.")}</p>`}
+            </section>
+        `;
+
+        return `
+            <article class="analysis-card">
+                <div class="analysis-card-heading">
+                    <h3>${esc(pretty(type))}</h3>
+                    <span class="analysis-index">${String(index + 1).padStart(2, "0")}</span>
+                </div>
+                ${summary}
+                <details class="analysis-raw">
+                    <summary>View raw JSON / technical output</summary>
+                    <pre>${esc(raw)}</pre>
+                </details>
+                <div class="analysis-timestamp">
+                    ${esc(timestamp ? formatDate(timestamp) : "Saved analysis record")}
+                </div>
+            </article>
+        `;
+    }).join("");
+}
+async function refreshCases(preferredId = state.selectedCaseId) {
+    try {
+        const response = await apiRequest("/api/cases");
+        state.cases = Array.isArray(response.cases) ? response.cases : [];
+
+        setConnection(true, "Backend connected");
+        renderCases();
+
+        let nextId = preferredId;
+
+        if (!state.cases.some((item) => String(item.case_id) === String(nextId))) {
+            nextId = state.cases.length ? state.cases[0].case_id : null;
+        }
+
+        if (nextId !== null && nextId !== undefined) {
+            await selectCase(nextId, false);
+        } else {
+            state.selectedCaseId = null;
+            state.evidence = [];
+            state.analyses = [];
+            renderSelectedCase();
+            renderEvidence();
+            renderAnalyses();
+            $("#stat-evidence").textContent = 0;
+            $("#stat-analyses").textContent = 0;
+        }
+    } catch (error) {
+        setConnection(false, "Connection failed");
+        $("#case-list").innerHTML = `
+            <div class="list-empty">
+                <p>${escapeHtml(error.message)}</p>
+                <button class="secondary-button" id="retry-cases">Try again</button>
+            </div>
+        `;
+        $("#retry-cases")?.addEventListener("click", () => refreshCases());
+        showNotice(error.message, "error");
+    }
+}
+
+async function selectCase(caseId, updateUrl = true) {
+    state.selectedCaseId = caseId;
+    state.evidence = [];
+    state.analyses = [];
+
+    renderSelectedCase();
+    renderEvidence();
+    renderAnalyses();
+
+    try {
+        const [caseResponse, evidenceResponse, analysesResponse] = await Promise.all([
+            apiRequest(`/api/cases/${encodeURIComponent(caseId)}`),
+            apiRequest(`/api/cases/${encodeURIComponent(caseId)}/evidence`),
+            apiRequest(`/api/cases/${encodeURIComponent(caseId)}/analyses`)
+        ]);
+
+        const caseData = caseResponse.case;
+
+        if (caseData) {
+            const index = state.cases.findIndex(
+                (item) => String(item.case_id) === String(caseId)
+            );
+
+            if (index >= 0) {
+                state.cases[index] = { ...state.cases[index], ...caseData };
+            } else {
+                state.cases.push(caseData);
+            }
+        }
+
+        state.evidence = Array.isArray(evidenceResponse.evidence)
+            ? evidenceResponse.evidence
+            : [];
+
+        state.analyses = Array.isArray(analysesResponse.analyses)
+            ? analysesResponse.analyses
+            : [];
+
+        renderSelectedCase();
+        renderEvidence();
+        renderAnalyses();
+        updateStats();
+    } catch (error) {
+        showNotice(`Could not load investigation details: ${error.message}`, "error");
+    }
+}
+
+function openCaseModal() {
+    $("#case-modal").classList.remove("hidden");
+    $("#case-title").focus();
+}
+
+function closeCaseModal() {
+    $("#case-modal").classList.add("hidden");
+    $("#create-case-form").reset();
+}
+
+async function createCase(event) {
+    event.preventDefault();
+
+    const title = $("#case-title").value.trim();
+    const description = $("#case-description").value.trim();
+    const button = $("#create-case-submit");
+
+    if (!title) {
+        showNotice("Enter an investigation title first.", "error");
+        return;
+    }
+
+    setBusy(button, true, "Creating…");
+
+    try {
+        const response = await apiRequest("/api/cases", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title, description })
+        });
+
+        const createdCase = response.case;
+
+        if (!createdCase || createdCase.case_id === undefined) {
+            throw new Error("The API response did not contain the new case identifier.");
+        }
+
+        closeCaseModal();
+        await refreshCases(createdCase.case_id);
+        showNotice("Investigation created successfully.");
+    } catch (error) {
+        showNotice(`Could not create investigation: ${error.message}`, "error");
+    } finally {
+        setBusy(button, false);
+    }
+}
+
+function updateSelectedFilename() {
+    const file = $("#evidence-file").files[0];
+    const modality = $("#evidence-modality").value;
+
+    $("#selected-file-name").textContent = file
+        ? `${file.name} · ${formatBytes(file.size)}`
+        : "No file selected";
+
+    const caseData = state.cases.find(
+        (item) => String(item.case_id) === String(state.selectedCaseId)
+    );
+    const caseIsOpen = caseData &&
+        String(caseData.status || "open").toLowerCase() === "open";
+
+    $("#upload-evidence").disabled =
+        !file || !caseIsOpen || state.busy;
+
+    const acceptTypes = {
+        image: "image/*",
+        audio: "audio/*,.mp3,.m4a,.wav,.ogg,.flac,.webm",
+        video: "video/*"
+    };
+
+    $("#evidence-file").accept = acceptTypes[modality] || "";
+}
+
+async function uploadEvidence() {
+    const file = $("#evidence-file").files[0];
+    const modality = $("#evidence-modality").value;
+    const caseId = state.selectedCaseId;
+    const button = $("#upload-evidence");
+
+    if (!caseId) {
+        showNotice("Select an investigation before uploading evidence.", "error");
+        return;
+    }
+
+    if (!file) {
+        showNotice("Choose a file to register.", "error");
+        return;
+    }
+
+    const selectedCase = state.cases.find(
+        (item) => String(item.case_id) === String(caseId)
+    );
+
+    if (String(selectedCase?.status || "open").toLowerCase() !== "open") {
+        showNotice("This investigation is closed. Reopen it before adding evidence.", "error");
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("modality", modality);
+    formData.append(modality, file);
+
+    setBusy(button, true, "Registering…");
+    state.busy = true;
+
+    try {
+        const response = await apiRequest(
+            `/api/cases/${encodeURIComponent(caseId)}/evidence`,
+            { method: "POST", body: formData }
+        );
+
+        $("#evidence-file").value = "";
+        updateSelectedFilename();
+
+        await selectCase(caseId);
+        showNotice(response.message || "Evidence registered successfully.");
+    } catch (error) {
+        showNotice(`Evidence registration failed: ${error.message}`, "error");
+    } finally {
+        state.busy = false;
+        setBusy(button, false);
+        updateSelectedFilename();
+    }
+}
+
+async function analyzeCase() {
+    const caseId = state.selectedCaseId;
+
+    if (!caseId) {
+        showNotice("Select an investigation before running analysis.", "error");
+        return;
+    }
+
+    const button = $("#analyze-case");
+    setBusy(button, true, "Analyzing…");
+    state.busy = true;
+    $("#upload-evidence").disabled = true;
+
+    try {
+        const response = await apiRequest(
+            `/api/cases/${encodeURIComponent(caseId)}/analyze`,
+            { method: "POST" }
+        );
+
+        // Reload persisted records so the display reflects what the backend saved.
+        await selectCase(caseId);
+        showNotice(
+            response.report
+                ? "Analysis request completed. Saved results have been refreshed."
+                : "Analysis request completed. Check the saved analysis records."
+        );
+
+        $("#results-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (error) {
+        showNotice(`Analysis failed: ${error.message}`, "error");
+    } finally {
+        state.busy = false;
+        setBusy(button, false);
+        updateSelectedCaseControls();
+    }
+}
+
+function updateSelectedCaseControls() {
+    const selectedCase = state.cases.find(
+        (item) => String(item.case_id) === String(state.selectedCaseId)
+    );
+    const isOpen = selectedCase &&
+        String(selectedCase.status || "open").toLowerCase() === "open";
+
+    $("#upload-evidence").disabled =
+        state.busy || !isOpen || !$("#evidence-file").files[0];
+
+    $("#analyze-case").disabled = state.busy || !selectedCase;
+}
+
+function navigateTo(view) {
+    const config = {
+        dashboard: {
+            title: "Investigation overview.",
+            description: "Organize cases, examine digital evidence, and review analysis findings in one workspace.",
+            target: null
+        },
+        cases: {
+            title: "Investigations.",
+            description: "Create, select, and manage investigation records.",
+            target: "#cases-panel"
+        },
+        evidence: {
+            title: "Evidence & analysis.",
+            description: "Register multimedia evidence and review the results produced by your local pipeline.",
+            target: "#detail-panel"
+        }
+    };
+
+    const selected = config[view] || config.dashboard;
+
+    $("#page-title").textContent = selected.title.slice(0, -1);
+    $("#page-title").innerHTML =
+        `${escapeHtml(selected.title.slice(0, -1))}<span class="title-period">.</span>`;
+    $("#page-description").textContent = selected.description;
+
+    document.querySelectorAll(".nav-item").forEach((item) => {
+        item.classList.toggle("active", item.dataset.view === view);
+    });
+
+    if (selected.target) {
+        $(selected.target).scrollIntoView({ behavior: "smooth", block: "start" });
+    } else {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+}
+
+function bindEvents() {
+    $("#new-case-open").addEventListener("click", openCaseModal);
+    $("#empty-create-case").addEventListener("click", openCaseModal);
+    $("#new-case-close").addEventListener("click", closeCaseModal);
+    $("#cancel-create-case").addEventListener("click", closeCaseModal);
+
+    $("#case-modal").addEventListener("click", (event) => {
+        if (event.target === $("#case-modal")) closeCaseModal();
+    });
+
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeCaseModal();
+    });
+
+    $("#create-case-form").addEventListener("submit", createCase);
+    $("#refresh-cases").addEventListener("click", () => refreshCases());
+    $("#evidence-file").addEventListener("change", updateSelectedFilename);
+    $("#evidence-modality").addEventListener("change", updateSelectedFilename);
+    $("#upload-evidence").addEventListener("click", uploadEvidence);
+    $("#analyze-case").addEventListener("click", analyzeCase);
+
+    document.querySelectorAll(".nav-item").forEach((item) => {
+        item.addEventListener("click", () => navigateTo(item.dataset.view));
+    });
+}
+
+async function init() {
+    bindEvents();
+    updateSelectedFilename();
+
+    try {
+        await apiRequest("/health");
+        setConnection(true, "Backend connected");
+    } catch (error) {
+        setConnection(false, "Connection failed");
+        showNotice(error.message, "error");
+    }
+
+    await refreshCases(null);
+}
+
+document.addEventListener("DOMContentLoaded", init);
