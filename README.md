@@ -232,3 +232,4 @@ These are proposed enhancements, not claims that the current prototype already p
 ## License and attribution
 
 Add the project's chosen license and record the licenses/attributions for third-party models, datasets, and libraries before redistribution. Do not assume that every downloaded model weight can be redistributed freely.
+CrimeVision is a multimodal AI-powered forensic analysis platform that analyzes images, videos, and audio to detect objects, reconstruct event timelines, correlate evidence, and generate investigation insights.
